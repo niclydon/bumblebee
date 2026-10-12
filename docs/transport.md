@@ -59,7 +59,11 @@ HTTP behavior:
 - Batching is line-count based. `--http-batch-size` controls records per POST.
 - HTTPS is required for non-loopback hosts unless `--http-allow-insecure` is set.
 - Bearer tokens and HMAC keys are read from environment variables, not CLI literals.
-- Non-2xx responses fail the run immediately.
+- Transport errors and HTTP 429, 502, 503, and 504 retry with jittered
+  exponential backoff (2s to 30s). `Retry-After` seconds are honored up to
+  30s. The retry budget is shared across batches and defaults to 10 minutes;
+  `--http-retry-max-elapsed=0` disables retries. Other non-2xx responses fail
+  immediately. If the retry budget expires, the run fails with the last error.
 - `scan_summary.http_batches_attempted`, `http_batches_succeeded`,
   `http_batches_failed`, and `http_last_status` report delivery results seen
   by the sink.

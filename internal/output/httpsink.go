@@ -16,9 +16,11 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"math/rand"
 	"net"
 	"net/http"
 	"net/url"
@@ -26,6 +28,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/perplexityai/bumblebee/internal/model"
 )
 
 // HTTPAuth describes how an HTTPSink authenticates each request.
@@ -62,6 +66,11 @@ type HTTPConfig struct {
 	Gzip bool
 	// HTTPClient is used for the POST. Tests inject a stub.
 	HTTPClient *http.Client
+	// RetryMaxElapsed is shared across all batches. Zero defaults to ten
+	// minutes; a negative value disables retries.
+	RetryMaxElapsed time.Duration
+	Diagnostics     io.Writer
+	RunID           string
 }
 
 // HTTPSink implements io.WriteCloser. Each Write must be one complete
@@ -73,20 +82,25 @@ type HTTPSink struct {
 	cfg    HTTPConfig
 	client *http.Client
 
-	mu      sync.Mutex
-	buf     bytes.Buffer
-	inBatch int
-	err     error
-	closed  bool
-	stats   SinkStats
+	mu            sync.Mutex
+	buf           bytes.Buffer
+	inBatch       int
+	err           error
+	closed        bool
+	stats         SinkStats
+	retryDeadline time.Time
+	sleep         func(time.Duration)
+	now           func() time.Time
 }
 
 const (
-	defaultBatchSize   = 500
-	defaultTimeout     = 30 * time.Second
-	defaultHMACHeader  = "X-Inventory-Signature"
-	contentTypeNDJSON  = "application/x-ndjson"
-	maxResponseSnippet = 512
+	defaultBatchSize       = 500
+	defaultTimeout         = 30 * time.Second
+	defaultHMACHeader      = "X-Inventory-Signature"
+	contentTypeNDJSON      = "application/x-ndjson"
+	maxResponseSnippet     = 512
+	defaultRetryMaxElapsed = 10 * time.Minute
+	maxRetryBackoff        = 30 * time.Second
 )
 
 // NewHTTPSink validates cfg and constructs the sink.
@@ -98,7 +112,7 @@ func NewHTTPSink(cfg HTTPConfig) (*HTTPSink, error) {
 	if client == nil {
 		client = &http.Client{Timeout: cfg.Timeout}
 	}
-	return &HTTPSink{cfg: cfg, client: client}, nil
+	return &HTTPSink{cfg: cfg, client: client, sleep: time.Sleep, now: time.Now}, nil
 }
 
 func validateHTTPConfig(cfg *HTTPConfig) error {
@@ -137,6 +151,9 @@ func validateHTTPConfig(cfg *HTTPConfig) error {
 	}
 	if cfg.Timeout <= 0 {
 		cfg.Timeout = defaultTimeout
+	}
+	if cfg.RetryMaxElapsed == 0 {
+		cfg.RetryMaxElapsed = defaultRetryMaxElapsed
 	}
 	return nil
 }
@@ -211,39 +228,91 @@ func (h *HTTPSink) flushLocked() error {
 		wireBody = gz.Bytes()
 	}
 
-	req, err := http.NewRequest(http.MethodPost, h.cfg.URL, bytes.NewReader(wireBody))
-	if err != nil {
-		return fmt.Errorf("http sink: build request: %w", err)
-	}
-	req.Header.Set("Content-Type", contentTypeNDJSON)
-	if h.cfg.Gzip {
-		req.Header.Set("Content-Encoding", "gzip")
-	}
-	if h.cfg.UserAgent != "" {
-		req.Header.Set("User-Agent", h.cfg.UserAgent)
-	}
-	if err := applyAuth(req, h.cfg.Auth, wireBody); err != nil {
-		return err
-	}
-
 	h.stats.HTTPBatchesAttempted++
-	resp, err := h.client.Do(req)
-	if err != nil {
-		h.stats.HTTPBatchesFailed++
-		h.stats.HTTPLastStatus = 0
-		return fmt.Errorf("http sink: post: %w", err)
-	}
-	defer resp.Body.Close()
-	h.stats.HTTPLastStatus = resp.StatusCode
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		h.stats.HTTPBatchesFailed++
+	for attempt := 1; ; attempt++ {
+		// Rebuild and re-sign on every attempt: HMAC timestamps must be fresh.
+		req, err := http.NewRequest(http.MethodPost, h.cfg.URL, bytes.NewReader(wireBody))
+		if err != nil {
+			return fmt.Errorf("http sink: build request: %w", err)
+		}
+		req.Header.Set("Content-Type", contentTypeNDJSON)
+		if h.cfg.Gzip {
+			req.Header.Set("Content-Encoding", "gzip")
+		}
+		if h.cfg.UserAgent != "" {
+			req.Header.Set("User-Agent", h.cfg.UserAgent)
+		}
+		if err := applyAuth(req, h.cfg.Auth, wireBody, h.now()); err != nil {
+			return err
+		}
+
+		resp, err := h.client.Do(req)
+		if err != nil {
+			h.stats.HTTPLastStatus = 0
+			lastErr := fmt.Errorf("http sink: post: %w", err)
+			if !h.waitToRetry(attempt, "transport", 0) {
+				h.stats.HTTPBatchesFailed++
+				return lastErr
+			}
+			continue
+		}
+		h.stats.HTTPLastStatus = resp.StatusCode
+		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+			_, _ = io.Copy(io.Discard, resp.Body)
+			_ = resp.Body.Close()
+			h.stats.HTTPBatchesSucceeded++
+			return nil
+		}
 		snippet, _ := io.ReadAll(io.LimitReader(resp.Body, maxResponseSnippet))
-		return fmt.Errorf("http sink: server returned %d: %s", resp.StatusCode, strings.TrimSpace(string(snippet)))
+		_ = resp.Body.Close()
+		lastErr := fmt.Errorf("http sink: server returned %d: %s", resp.StatusCode, strings.TrimSpace(string(snippet)))
+		if !retryableHTTPStatus(resp.StatusCode) || !h.waitToRetry(attempt, fmt.Sprintf("status=%d", resp.StatusCode), retryAfterDelay(resp.Header.Get("Retry-After"))) {
+			h.stats.HTTPBatchesFailed++
+			return lastErr
+		}
 	}
-	// Drain any remaining body so the connection can be reused.
-	_, _ = io.Copy(io.Discard, resp.Body)
-	h.stats.HTTPBatchesSucceeded++
-	return nil
+}
+
+func retryableHTTPStatus(status int) bool {
+	return status == 429 || status == 502 || status == 503 || status == 504
+}
+
+func retryAfterDelay(value string) time.Duration {
+	seconds, err := strconv.Atoi(strings.TrimSpace(value))
+	if err != nil || seconds < 0 {
+		return 0
+	}
+	if seconds >= int(maxRetryBackoff/time.Second) {
+		return maxRetryBackoff
+	}
+	return time.Duration(seconds) * time.Second
+}
+
+func (h *HTTPSink) waitToRetry(attempt int, reason string, retryAfter time.Duration) bool {
+	if h.cfg.RetryMaxElapsed < 0 {
+		return false
+	}
+	if h.retryDeadline.IsZero() {
+		h.retryDeadline = h.now().Add(h.cfg.RetryMaxElapsed)
+	}
+	backoff := 2 * time.Second
+	for i := 1; i < attempt && backoff < maxRetryBackoff; i++ {
+		backoff = min(backoff*2, maxRetryBackoff)
+	}
+	// Jitter applies to exponential backoff; server Retry-After is a floor.
+	wait := max(min(time.Duration(float64(backoff)*(0.8+rand.Float64()*0.4)), maxRetryBackoff), retryAfter)
+	if h.now().Add(wait).After(h.retryDeadline) {
+		return false
+	}
+	if h.cfg.Diagnostics != nil {
+		d := model.Diagnostic{RecordType: model.RecordTypeDiagnostic, RunID: h.cfg.RunID,
+			Time: h.now().UTC().Format(time.RFC3339Nano), Level: "info",
+			Message: fmt.Sprintf("http sink retry attempt=%d %s wait=%s", attempt+1, reason, wait)}
+		d.RecordID = d.StableID()
+		_ = json.NewEncoder(h.cfg.Diagnostics).Encode(d)
+	}
+	h.sleep(wait)
+	return h.now().Before(h.retryDeadline)
 }
 
 // Stats returns best-effort delivery counters for scan_summary
@@ -257,7 +326,7 @@ func (h *HTTPSink) Stats() SinkStats {
 	return h.stats
 }
 
-func applyAuth(req *http.Request, a HTTPAuth, body []byte) error {
+func applyAuth(req *http.Request, a HTTPAuth, body []byte, now time.Time) error {
 	switch a.Mode {
 	case "none":
 		return nil
@@ -267,7 +336,7 @@ func applyAuth(req *http.Request, a HTTPAuth, body []byte) error {
 	case "hmac-sha256":
 		var signedPayload []byte
 		if a.TimestampHeader != "" {
-			ts := strconv.FormatInt(time.Now().Unix(), 10)
+			ts := strconv.FormatInt(now.Unix(), 10)
 			req.Header.Set(a.TimestampHeader, ts)
 			signedPayload = append([]byte(ts+"."), body...)
 		} else {

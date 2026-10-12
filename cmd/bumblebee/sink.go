@@ -13,15 +13,17 @@ import (
 // openSink signature does not balloon. Fields here mirror the
 // corresponding --http-* flags one-to-one.
 type sinkHTTPOpts struct {
-	URL       string
-	AuthMode  string
-	TokenEnv  string
-	KeyEnv    string
-	Timeout   time.Duration
-	BatchSize int
-	AllowHTTP bool
-	Gzip      bool
-	UserAgent string
+	URL             string
+	AuthMode        string
+	TokenEnv        string
+	KeyEnv          string
+	Timeout         time.Duration
+	RetryMaxElapsed time.Duration
+	RunID           string
+	BatchSize       int
+	AllowHTTP       bool
+	Gzip            bool
+	UserAgent       string
 }
 
 // openSink returns the io.Writer the emitter should write records to,
@@ -57,13 +59,16 @@ func openSink(dest, filePath string, appendMode bool, h sinkHTTPOpts) (io.Writer
 			return nil, nil, err
 		}
 		sink, err := output.NewHTTPSink(output.HTTPConfig{
-			URL:           h.URL,
-			Auth:          auth,
-			Timeout:       h.Timeout,
-			BatchSize:     h.BatchSize,
-			UserAgent:     h.UserAgent,
-			AllowInsecure: h.AllowHTTP,
-			Gzip:          h.Gzip,
+			URL:             h.URL,
+			Auth:            auth,
+			Timeout:         h.Timeout,
+			RetryMaxElapsed: h.RetryMaxElapsed,
+			Diagnostics:     os.Stderr,
+			RunID:           h.RunID,
+			BatchSize:       h.BatchSize,
+			UserAgent:       h.UserAgent,
+			AllowInsecure:   h.AllowHTTP,
+			Gzip:            h.Gzip,
 		})
 		if err != nil {
 			return nil, nil, err

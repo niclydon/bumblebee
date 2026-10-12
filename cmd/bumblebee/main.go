@@ -110,18 +110,19 @@ type scanOpts struct {
 
 	allUsers bool
 
-	outputDest    string
-	outputFile    string
-	appendFile    bool
-	emitSummary   bool
-	httpURL       string
-	httpAuth      string
-	httpTokenEnv  string
-	httpKeyEnv    string
-	httpTimeout   time.Duration
-	httpBatchSize int
-	httpAllowHTTP bool
-	httpGzip      bool
+	outputDest          string
+	outputFile          string
+	appendFile          bool
+	emitSummary         bool
+	httpURL             string
+	httpAuth            string
+	httpTokenEnv        string
+	httpKeyEnv          string
+	httpTimeout         time.Duration
+	httpRetryMaxElapsed time.Duration
+	httpBatchSize       int
+	httpAllowHTTP       bool
+	httpGzip            bool
 
 	deviceIDEnv string
 }
@@ -155,6 +156,7 @@ func registerScanFlags(fs *flag.FlagSet, o *scanOpts) {
 	fs.StringVar(&o.httpTokenEnv, "http-token-env", "", "env var holding the bearer token (for --http-auth=bearer)")
 	fs.StringVar(&o.httpKeyEnv, "http-hmac-key-env", "", "env var holding the HMAC shared secret (for --http-auth=hmac-sha256)")
 	fs.DurationVar(&o.httpTimeout, "http-timeout", 30*time.Second, "per-request timeout for --output=http")
+	fs.DurationVar(&o.httpRetryMaxElapsed, "http-retry-max-elapsed", 10*time.Minute, "run-wide retry budget for transient HTTP failures (0 disables)")
 	fs.IntVar(&o.httpBatchSize, "http-batch-size", 500, "records per POST for --output=http")
 	fs.BoolVar(&o.httpAllowHTTP, "http-allow-insecure", false, "allow plain http:// to non-loopback hosts (testing only)")
 	fs.BoolVar(&o.httpGzip, "http-gzip", false, "gzip the POST body for --output=http (Content-Encoding: gzip)")
@@ -203,23 +205,29 @@ func runScan(args []string) int {
 		}
 	}
 
+	runID := newRunID()
+	retryBudget := o.httpRetryMaxElapsed
+	if retryBudget == 0 {
+		retryBudget = -1
+	}
 	recordsW, closeFn, err := openSink(o.outputDest, o.outputFile, o.appendFile, sinkHTTPOpts{
-		URL:       o.httpURL,
-		AuthMode:  o.httpAuth,
-		TokenEnv:  o.httpTokenEnv,
-		KeyEnv:    o.httpKeyEnv,
-		Timeout:   o.httpTimeout,
-		BatchSize: o.httpBatchSize,
-		AllowHTTP: o.httpAllowHTTP,
-		Gzip:      o.httpGzip,
-		UserAgent: fmt.Sprintf("bumblebee/%s", currentVersion()),
+		URL:             o.httpURL,
+		AuthMode:        o.httpAuth,
+		TokenEnv:        o.httpTokenEnv,
+		KeyEnv:          o.httpKeyEnv,
+		Timeout:         o.httpTimeout,
+		RetryMaxElapsed: retryBudget,
+		RunID:           runID,
+		BatchSize:       o.httpBatchSize,
+		AllowHTTP:       o.httpAllowHTTP,
+		Gzip:            o.httpGzip,
+		UserAgent:       fmt.Sprintf("bumblebee/%s", currentVersion()),
 	})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err.Error())
 		return 2
 	}
 
-	runID := newRunID()
 	emitter := output.New(recordsW, os.Stderr, runID)
 
 	for _, n := range diagNotes {
