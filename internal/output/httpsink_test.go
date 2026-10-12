@@ -6,12 +6,14 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/perplexityai/bumblebee/internal/model"
 )
@@ -20,6 +22,140 @@ func TestHTTPSink_RejectsPlainHTTPToRemote(t *testing.T) {
 	_, err := NewHTTPSink(HTTPConfig{URL: "http://example.com/ingest"})
 	if err == nil || !strings.Contains(err.Error(), "refusing plain http") {
 		t.Fatalf("expected plain-http refusal, got %v", err)
+	}
+}
+
+func fakeRetryClock(sink *HTTPSink) *[]time.Duration {
+	now := time.Unix(1000, 0)
+	waits := []time.Duration{}
+	sink.now = func() time.Time { return now }
+	sink.sleep = func(d time.Duration) { waits = append(waits, d); now = now.Add(d) }
+	return &waits
+}
+
+func TestHTTPSink_RetriesTransientStatusWithSameBodyAndFreshHMAC(t *testing.T) {
+	var bodies [][]byte
+	var timestamps []string
+	var signatures []string
+	var diagnostics bytes.Buffer
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		bodies = append(bodies, body)
+		timestamps = append(timestamps, r.Header.Get("X-Inventory-Timestamp"))
+		signatures = append(signatures, r.Header.Get("X-Inventory-Signature"))
+		if len(bodies) < 3 {
+			w.WriteHeader(http.StatusBadGateway)
+		} else {
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer srv.Close()
+	sink, err := NewHTTPSink(HTTPConfig{URL: srv.URL, BatchSize: 1, Gzip: true,
+		RetryMaxElapsed: time.Minute, Diagnostics: &diagnostics, RunID: "test-run",
+		Auth: HTTPAuth{Mode: "hmac-sha256", HMACKey: []byte("test-key"), TimestampHeader: "X-Inventory-Timestamp"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waits := fakeRetryClock(sink)
+	if _, err := sink.Write([]byte("{}\n")); err != nil {
+		t.Fatal(err)
+	}
+	if len(bodies) != 3 || !bytes.Equal(bodies[0], bodies[1]) || !bytes.Equal(bodies[1], bodies[2]) {
+		t.Fatalf("wanted three identical attempts, got %d", len(bodies))
+	}
+	if timestamps[0] == timestamps[1] || timestamps[1] == timestamps[2] || signatures[0] == signatures[1] {
+		t.Fatal("HMAC timestamp/signature was not regenerated for each attempt")
+	}
+	if len(*waits) != 2 || !strings.Contains(diagnostics.String(), "http sink retry attempt=2 status=502") {
+		t.Fatalf("missing retry waits/diagnostic: waits=%v diag=%s", *waits, diagnostics.String())
+	}
+	if got := sink.Stats(); got.HTTPBatchesAttempted != 1 || got.HTTPBatchesSucceeded != 1 || got.HTTPBatchesFailed != 0 || got.HTTPLastStatus != 200 {
+		t.Fatalf("wrong logical batch stats: %+v", got)
+	}
+}
+
+type retryTransport func(*http.Request) (*http.Response, error)
+
+func (f retryTransport) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+func TestHTTPSink_RetriesTransportError(t *testing.T) {
+	posts := 0
+	client := &http.Client{Transport: retryTransport(func(r *http.Request) (*http.Response, error) {
+		posts++
+		if posts == 1 {
+			return nil, errors.New("connection refused")
+		}
+		return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader("")), Header: make(http.Header)}, nil
+	})}
+	sink, err := NewHTTPSink(HTTPConfig{URL: "https://example.com/ingest", BatchSize: 1, HTTPClient: client})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fakeRetryClock(sink)
+	if _, err := sink.Write([]byte("{}\n")); err != nil {
+		t.Fatal(err)
+	}
+	if posts != 2 || sink.Stats().HTTPBatchesFailed != 0 {
+		t.Fatalf("posts=%d stats=%+v", posts, sink.Stats())
+	}
+}
+
+func TestHTTPSink_RetryAfterAndBudget(t *testing.T) {
+	posts := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		posts++
+		w.Header().Set("Retry-After", "7")
+		if posts == 1 {
+			w.WriteHeader(429)
+		} else {
+			w.WriteHeader(200)
+		}
+	}))
+	defer srv.Close()
+	sink, err := NewHTTPSink(HTTPConfig{URL: srv.URL, BatchSize: 1, RetryMaxElapsed: 20 * time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waits := fakeRetryClock(sink)
+	if _, err := sink.Write([]byte("{}\n")); err != nil {
+		t.Fatal(err)
+	}
+	if posts != 2 || len(*waits) != 1 || (*waits)[0] != 7*time.Second {
+		t.Fatalf("posts=%d waits=%v", posts, *waits)
+	}
+
+	posts = 0
+	sink, err = NewHTTPSink(HTTPConfig{URL: srv.URL, BatchSize: 1, RetryMaxElapsed: 3 * time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fakeRetryClock(sink)
+	// Retry-After exceeds the remaining budget: no second request.
+	if _, err := sink.Write([]byte("{}\n")); err == nil || !strings.Contains(err.Error(), "429") {
+		t.Fatalf("want last 429, got %v", err)
+	}
+	if posts != 1 || sink.Stats().HTTPBatchesFailed != 1 {
+		t.Fatalf("posts=%d stats=%+v", posts, sink.Stats())
+	}
+}
+
+func TestHTTPSink_NonRetryableAndDisabled(t *testing.T) {
+	for _, tc := range []struct {
+		status int
+		budget time.Duration
+	}{{400, 0}, {500, 0}, {502, -1}} {
+		posts := 0
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { posts++; w.WriteHeader(tc.status) }))
+		sink, err := NewHTTPSink(HTTPConfig{URL: srv.URL, BatchSize: 1, RetryMaxElapsed: tc.budget})
+		if err != nil {
+			t.Fatal(err)
+		}
+		fakeRetryClock(sink)
+		_, err = sink.Write([]byte("{}\n"))
+		if err == nil || posts != 1 || sink.Stats().HTTPBatchesFailed != 1 {
+			t.Fatalf("status=%d posts=%d err=%v", tc.status, posts, err)
+		}
+		srv.Close()
 	}
 }
 
