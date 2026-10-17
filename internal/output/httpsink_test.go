@@ -6,12 +6,14 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/perplexityai/bumblebee/internal/model"
 )
@@ -269,6 +271,117 @@ func TestHTTPSink_GzipPlusHMACSignsCompressedBody(t *testing.T) {
 	want := "sha256=" + hex.EncodeToString(mac.Sum(nil))
 	if got := cap.headers[0].Get("X-Inventory-Signature"); got != want {
 		t.Fatalf("signature mismatch\n got %s\nwant %s", got, want)
+	}
+}
+
+// OB-63965: a mid-run nexus-api restart (502/503) must not fail the scan.
+func TestHTTPSink_RetriesGatewayErrorsThenSucceeds(t *testing.T) {
+	var calls int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		if calls < 3 {
+			w.WriteHeader(http.StatusBadGateway)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	sink, err := NewHTTPSink(HTTPConfig{URL: srv.URL, BatchSize: 1, RetryBaseDelay: time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sink.Write([]byte("{\"a\":1}\n")); err != nil {
+		t.Fatalf("write after retryable 502s: %v", err)
+	}
+	if err := sink.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	if calls != 3 {
+		t.Fatalf("expected 3 attempts, got %d", calls)
+	}
+	stats := sink.Stats()
+	if stats.HTTPBatchesAttempted != 3 || stats.HTTPBatchesSucceeded != 1 || stats.HTTPBatchesFailed != 0 {
+		t.Fatalf("unexpected stats: %+v", stats)
+	}
+}
+
+func TestHTTPSink_GivesUpAfterFiveAttempts(t *testing.T) {
+	var calls int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer srv.Close()
+
+	sink, err := NewHTTPSink(HTTPConfig{URL: srv.URL, BatchSize: 1, RetryBaseDelay: time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sink.Write([]byte("{\"a\":1}\n")); err == nil {
+		t.Fatal("expected error after exhausting retries")
+	}
+	if calls != 5 {
+		t.Fatalf("expected 5 attempts, got %d", calls)
+	}
+	if stats := sink.Stats(); stats.HTTPBatchesFailed != 1 || stats.HTTPLastStatus != http.StatusServiceUnavailable {
+		t.Fatalf("unexpected stats: %+v", stats)
+	}
+}
+
+func TestHTTPSink_DoesNotRetryClientErrors(t *testing.T) {
+	var calls int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		w.WriteHeader(http.StatusBadRequest)
+	}))
+	defer srv.Close()
+
+	sink, err := NewHTTPSink(HTTPConfig{URL: srv.URL, BatchSize: 1, RetryBaseDelay: time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sink.Write([]byte("{\"a\":1}\n")); err == nil {
+		t.Fatal("expected error from 400")
+	}
+	if calls != 1 {
+		t.Fatalf("400 must not be retried, got %d calls", calls)
+	}
+}
+
+type flakyTransport struct {
+	failures int
+	calls    int
+}
+
+func (f *flakyTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	f.calls++
+	if f.calls <= f.failures {
+		return nil, errors.New("connection refused")
+	}
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Body:       io.NopCloser(strings.NewReader("")),
+		Header:     make(http.Header),
+		Request:    req,
+	}, nil
+}
+
+func TestHTTPSink_RetriesTransportErrors(t *testing.T) {
+	rt := &flakyTransport{failures: 2}
+	sink, err := NewHTTPSink(HTTPConfig{
+		URL: "https://ingest.example.test/v1", BatchSize: 1,
+		RetryBaseDelay: time.Millisecond,
+		HTTPClient:     &http.Client{Transport: rt},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sink.Write([]byte("{\"a\":1}\n")); err != nil {
+		t.Fatalf("write after transport retries: %v", err)
+	}
+	if rt.calls != 3 {
+		t.Fatalf("expected 3 attempts, got %d", rt.calls)
 	}
 }
 

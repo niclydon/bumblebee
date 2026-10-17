@@ -62,6 +62,10 @@ type HTTPConfig struct {
 	Gzip bool
 	// HTTPClient is used for the POST. Tests inject a stub.
 	HTTPClient *http.Client
+	// RetryBaseDelay is the first backoff sleep between delivery retries
+	// (doubled per attempt, capped). Zero uses the default. Tests set a
+	// tiny value so retry cases stay fast.
+	RetryBaseDelay time.Duration
 }
 
 // HTTPSink implements io.WriteCloser. Each Write must be one complete
@@ -87,6 +91,16 @@ const (
 	defaultHMACHeader  = "X-Inventory-Signature"
 	contentTypeNDJSON  = "application/x-ndjson"
 	maxResponseSnippet = 512
+
+	// Delivery retry (OB-63965): a nexus-api restart mid-scan used to fail
+	// the whole run on the first 502. Retry transient gateway statuses and
+	// transport errors with bounded exponential backoff: 5 attempts total,
+	// 1s base doubling per attempt, per-sleep cap 30s, Retry-After honored
+	// up to 60s.
+	maxDeliveryAttempts = 5
+	defaultRetryBase    = time.Second
+	maxRetrySleep       = 30 * time.Second
+	maxRetryAfter       = 60 * time.Second
 )
 
 // NewHTTPSink validates cfg and constructs the sink.
@@ -211,9 +225,44 @@ func (h *HTTPSink) flushLocked() error {
 		wireBody = gz.Bytes()
 	}
 
+	base := h.cfg.RetryBaseDelay
+	if base <= 0 {
+		base = defaultRetryBase
+	}
+	var lastErr error
+	for attempt := 1; attempt <= maxDeliveryAttempts; attempt++ {
+		status, retryAfter, err := h.postOnce(wireBody)
+		if err == nil {
+			h.stats.HTTPBatchesSucceeded++
+			return nil
+		}
+		lastErr = err
+		retryable := status == 0 || status == http.StatusBadGateway || status == http.StatusServiceUnavailable
+		if !retryable || attempt == maxDeliveryAttempts {
+			break
+		}
+		sleep := base << (attempt - 1)
+		if sleep > maxRetrySleep {
+			sleep = maxRetrySleep
+		}
+		if retryAfter > sleep {
+			sleep = retryAfter
+			if sleep > maxRetryAfter {
+				sleep = maxRetryAfter
+			}
+		}
+		time.Sleep(sleep)
+	}
+	h.stats.HTTPBatchesFailed++
+	return lastErr
+}
+
+// postOnce performs a single POST attempt. It returns the HTTP status (0 on
+// transport error), any Retry-After hint, and the attempt error (nil on 2xx).
+func (h *HTTPSink) postOnce(wireBody []byte) (int, time.Duration, error) {
 	req, err := http.NewRequest(http.MethodPost, h.cfg.URL, bytes.NewReader(wireBody))
 	if err != nil {
-		return fmt.Errorf("http sink: build request: %w", err)
+		return 0, 0, fmt.Errorf("http sink: build request: %w", err)
 	}
 	req.Header.Set("Content-Type", contentTypeNDJSON)
 	if h.cfg.Gzip {
@@ -223,27 +272,29 @@ func (h *HTTPSink) flushLocked() error {
 		req.Header.Set("User-Agent", h.cfg.UserAgent)
 	}
 	if err := applyAuth(req, h.cfg.Auth, wireBody); err != nil {
-		return err
+		return 0, 0, err
 	}
 
 	h.stats.HTTPBatchesAttempted++
 	resp, err := h.client.Do(req)
 	if err != nil {
-		h.stats.HTTPBatchesFailed++
 		h.stats.HTTPLastStatus = 0
-		return fmt.Errorf("http sink: post: %w", err)
+		return 0, 0, fmt.Errorf("http sink: post: %w", err)
 	}
 	defer resp.Body.Close()
 	h.stats.HTTPLastStatus = resp.StatusCode
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		h.stats.HTTPBatchesFailed++
 		snippet, _ := io.ReadAll(io.LimitReader(resp.Body, maxResponseSnippet))
-		return fmt.Errorf("http sink: server returned %d: %s", resp.StatusCode, strings.TrimSpace(string(snippet)))
+		var retryAfter time.Duration
+		if secs, perr := strconv.Atoi(strings.TrimSpace(resp.Header.Get("Retry-After"))); perr == nil && secs > 0 {
+			retryAfter = time.Duration(secs) * time.Second
+		}
+		return resp.StatusCode, retryAfter, fmt.Errorf(
+			"http sink: server returned %d: %s", resp.StatusCode, strings.TrimSpace(string(snippet)))
 	}
 	// Drain any remaining body so the connection can be reused.
 	_, _ = io.Copy(io.Discard, resp.Body)
-	h.stats.HTTPBatchesSucceeded++
-	return nil
+	return resp.StatusCode, 0, nil
 }
 
 // Stats returns best-effort delivery counters for scan_summary
